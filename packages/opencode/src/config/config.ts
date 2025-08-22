@@ -345,7 +345,6 @@ export namespace Config {
         .describe("Command configuration, see https://opencode.ai/docs/commands"),
       plugin: z.string().array().optional(),
       snapshot: z.boolean().optional(),
-      chatMaxRetries: z.number().default(3).optional().describe("Number of retries for chat completions on failure"),
       share: z
         .enum(["manual", "auto", "disabled"])
         .optional()
@@ -464,6 +463,9 @@ export namespace Config {
                 .optional(),
             })
             .optional(),
+          chatMaxRetries: z
+            .number().optional()
+            .describe("Number of retries for chat completions on failure"),
         })
         .optional(),
     })
