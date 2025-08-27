@@ -805,7 +805,7 @@ export namespace Session {
     })
     const tools: Record<string, AITool> = {}
 
-    const processor = createProcessor(assistantMsg, model.info)
+    const processor = createProcessor(assistantMsg, model.info, input)
 
     const enabledTools = pipe(
       agent.tools,
@@ -942,6 +942,19 @@ export namespace Session {
         log.error("streamText error", {
           error: e,
         })
+        log.info("check if abort by user")
+        // Check if this is a connection break (AbortError) that should be retried
+        if (e instanceof DOMException && e.name === "AbortError") {
+          // Check if abort was user-initiated by looking at the controller
+          const controller = state().pending.get(input.sessionID)
+          if (controller && !controller.signal.aborted) {
+            // This was a connection break, not user-initiated abort
+            // The retry will be handled by the streamText library
+            log.info("Connection break detected, will retry", {
+              sessionID: input.sessionID,
+            })
+          }
+        }
       },
       async prepareStep({ messages }) {
         const queue = (state().queued.get(input.sessionID) ?? []).filter((x) => !x.processed)
@@ -1053,6 +1066,28 @@ export namespace Session {
       }),
     })
     const result = await processor.process(stream)
+
+    // Check if we need to retry due to connection break
+    if (processor.getShouldRetry()) {
+      log.info("Performing retry after connection break", {
+        sessionID: input.sessionID,
+      })
+      try {
+        // Create a new AbortController for the retry
+        const newController = new AbortController()
+        state().pending.set(input.sessionID, newController)
+
+        // Retry the operation
+        return await chat(input)
+      } catch (retryError) {
+        log.error("Retry after connection break failed", {
+          sessionID: input.sessionID,
+          error: retryError,
+        })
+        // Fall back to original result if retry fails
+      }
+    }
+
     const queued = state().queued.get(input.sessionID) ?? []
     const unprocessed = queued.find((x) => !x.processed)
     if (unprocessed) {
@@ -1314,16 +1349,28 @@ export namespace Session {
     })
   }
 
-  function createProcessor(assistantMsg: MessageV2.Assistant, model: ModelsDev.Model) {
+  function createProcessor(
+    assistantMsg: MessageV2.Assistant,
+    model: ModelsDev.Model,
+    _chatInput?: z.infer<typeof ChatInput>,
+  ) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
     let snapshot: string | undefined
     let shouldStop = false
+    let shouldRetry = false
+    let retryError: Error | null = null
     return {
       partFromToolCall(toolCallID: string) {
         return toolcalls[toolCallID]
       },
       getShouldStop() {
         return shouldStop
+      },
+      getShouldRetry() {
+        return shouldRetry
+      },
+      getRetryError() {
+        return retryError
       },
       async process(stream: StreamTextResult<Record<string, AITool>, never>) {
         try {
@@ -1552,12 +1599,24 @@ export namespace Session {
           })
           switch (true) {
             case e instanceof DOMException && e.name === "AbortError":
-              assistantMsg.error = new MessageV2.AbortedError(
-                { message: e.message },
-                {
-                  cause: e,
-                },
-              ).toObject()
+              // Check if this was a connection break that should be retried
+              const controller = state().pending.get(assistantMsg.sessionID)
+              if (controller && !controller.signal.aborted && !isUserAborted(assistantMsg.sessionID)) {
+                // This was a connection break, not user-initiated abort
+                log.info("Connection break detected, will retry after processing", {
+                  sessionID: assistantMsg.sessionID,
+                })
+                shouldRetry = true
+                retryError = e
+              } else {
+                // User-initiated abort or already handled
+                assistantMsg.error = new MessageV2.AbortedError(
+                  { message: e.message },
+                  {
+                    cause: e,
+                  },
+                ).toObject()
+              }
               break
             case MessageV2.OutputLengthError.isInstance(e):
               assistantMsg.error = e
@@ -1706,10 +1765,27 @@ export namespace Session {
     }
     await updateMessage(next)
 
-    const processor = createProcessor(next, model.info)
+    const processor = createProcessor(next, model.info, undefined)
     const stream = streamText({
       maxRetries: 10,
       abortSignal: abort.signal,
+      onError(e) {
+        log.error("summarize streamText error", {
+          error: e,
+        })
+        // Check if this is a connection break (AbortError) that should be retried
+        if (e instanceof DOMException && e.name === "AbortError") {
+          // Check if abort was user-initiated by looking at the controller
+          const controller = state().pending.get(input.sessionID)
+          if (controller && !controller.signal.aborted) {
+            // This was a connection break, not user-initiated abort
+            // The retry will be handled by the streamText library
+            log.info("Connection break detected in summarize, will retry", {
+              sessionID: input.sessionID,
+            })
+          }
+        }
+      },
       model: model.language,
       messages: [
         ...system.map(
@@ -1732,11 +1808,42 @@ export namespace Session {
     })
 
     const result = await processor.process(stream)
+
+    // Check if we need to retry due to connection break
+    if (processor.getShouldRetry()) {
+      log.info("Performing retry after connection break in summarize", {
+        sessionID: input.sessionID,
+      })
+      try {
+        // Create a new AbortController for the retry
+        const newController = new AbortController()
+        state().pending.set(input.sessionID, newController)
+
+        // Retry the summarize operation
+        return await summarize(input)
+      } catch (retryError) {
+        log.error("Retry after connection break failed in summarize", {
+          sessionID: input.sessionID,
+          error: retryError,
+        })
+        // Fall back to original result if retry fails
+      }
+    }
+
     return result
   }
 
   function isLocked(sessionID: string) {
     return state().pending.has(sessionID)
+  }
+
+  function isUserAborted(sessionID: string) {
+    // Check if abort was explicitly called by looking at abort state
+    // This is a simple heuristic - if the controller exists but wasn't aborted by us,
+    // it might be a connection break
+    log.info("isUserAborted", { sessionID })
+    const controller = state().pending.get(sessionID)
+    return controller ? controller.signal.aborted : false
   }
 
   function lock(sessionID: string) {
