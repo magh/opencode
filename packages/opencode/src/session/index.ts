@@ -937,13 +937,13 @@ export namespace Session {
         },
       },
     )
-    const stream = streamText({
-      onError(e) {
+    const createStreamTextConfig = () => ({
+      onError(event: { error: unknown }) {
         log.error("streamText error", {
-          error: e,
+          error: event.error,
         })
       },
-      async prepareStep({ messages }) {
+      async prepareStep({ messages }: { messages: ModelMessage[] }) {
         const queue = (state().queued.get(input.sessionID) ?? []).filter((x) => !x.processed)
         if (queue.length) {
           for (const item of queue) {
@@ -989,7 +989,7 @@ export namespace Session {
           messages,
         }
       },
-      async experimental_repairToolCall(input) {
+      async experimental_repairToolCall(input: any) {
         return {
           ...input.toolCall,
           input: JSON.stringify({
@@ -1010,7 +1010,7 @@ export namespace Session {
       activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
       maxOutputTokens: outputLimit,
       abortSignal: abort.signal,
-      stopWhen: async ({ steps }) => {
+      stopWhen: async ({ steps }: { steps: any[] }) => {
         if (steps.length >= 1000) {
           return true
         }
@@ -1052,7 +1052,43 @@ export namespace Session {
         ],
       }),
     })
-    const result = await processor.process(stream)
+
+    const streamWithRetry = async (maxRetries = 10) => {
+      let lastError: Error | undefined
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          log.info("streamText attempt", { attempt, maxRetries })
+          const stream = streamText(createStreamTextConfig())
+          const result = await processor.process(stream)
+          return result
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error))
+          log.warn("streamText attempt failed", {
+            attempt,
+            maxRetries,
+            error: lastError.message,
+          })
+
+          if (attempt === maxRetries) {
+            log.error("streamText failed after all retries", {
+              attempts: maxRetries,
+              error: lastError.message,
+            })
+            throw lastError
+          }
+
+          // Wait before retry with exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000)
+          log.info("retrying after delay", { delay, attempt, maxRetries })
+          await new Promise((resolve) => setTimeout(resolve, delay))
+        }
+      }
+
+      throw lastError || new Error("streamText failed after retries")
+    }
+
+    const result = await streamWithRetry()
     const queued = state().queued.get(input.sessionID) ?? []
     const unprocessed = queued.find((x) => !x.processed)
     if (unprocessed) {
@@ -1547,7 +1583,7 @@ export namespace Session {
             }
           }
         } catch (e) {
-          log.error("", {
+          log.error("streamText error", {
             error: e,
           })
           switch (true) {
@@ -1581,6 +1617,9 @@ export namespace Session {
             sessionID: assistantMsg.sessionID,
             error: assistantMsg.error,
           })
+
+          // Re-throw the error so retry logic can catch it
+          throw e
         }
         const p = await getParts(assistantMsg.id)
         for (const part of p) {
